@@ -29,9 +29,11 @@
 #include <limits>
 #include <numeric>
 #include <tuple>
+#include <vector>
 
 #include "allocator.h"
 #include "math.cuh"
+#include "pytorch_extension_utils.h"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -351,6 +353,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       thread_max = max(thread_max, logits_vec[j]);
     }
+    // NOTE: why not sync here?
     float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                           .Reduce(thread_max, cub::Max());
 
@@ -1326,6 +1329,7 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           }
         } else {
           // Path B: Single-Block Strategy
+          // Per-batch => Per-block
           // Switch input cache
           uint32_t cache_threshold;
           if (batch_size <= 16) {
@@ -2146,6 +2150,368 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});
+  return cudaSuccess;
+}
+
+// 用于类型特化
+template <typename ValType>
+struct ComputeT {
+  using type = ValType;
+};
+
+/*
+    K: ?
+    n: the longest task length, in topk sampling, all tasks length is same => valcabulary size d
+*/
+template <typename T>
+void getRadixSelectWorkSpaceSize(const int& K, const int& n, const int& taskNum,
+                                 size_t* sizeInBytes) {
+  using CompT = typename ComputeT<T>::type;
+  // TODO: This function is wrong, don't use K now.
+  // Find out how sizeInBytes is computed
+  *sizeInBytes =
+      taskNum * (sizeof(CompT) * n * 2     /* buffer for val */
+                 + sizeof(int) * (1 << 12) /* buffer for hist */
+                 + sizeof(int) * 5); /* buffer for globalCount,old_taskLen,new_taskLen,K,binId */
+  return;
+}
+
+static constexpr int MAX_GRID_SIZE = 1280;
+
+// TODO: is it necessary to change type(a) into CompT?
+template <int LEFT, int RIGHT>
+__device__ __forceinline__ int getBinId(const float& a) {
+  const uint32_t& u_a = reinterpret_cast<const uint32_t&>(a);
+  uint32_t mask = ((~(u_a >> 31)) + 1) | 0x80000000;
+  return static_cast<int>(((u_a ^ mask) << LEFT) >> RIGHT);
+}
+
+template <uint32_t BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T>
+__global__ void __launch_bounds__(1024)
+    countBinKernel(const T* dataIn, const int* taskLenPtr, int* histPtr, const int stride,
+                   const int taskNum) {
+  using CompT = typename ComputeT<T>::type;
+  const int bx = blockIdx.x, tx = threadIdx.x;
+  const int taskId = bx;
+
+  constexpr int histLen = 1 << (8 * sizeof(CompT) - RIGHT);
+  __shared__ int blockHist[histLen];
+  for (int i = tx; i < histLen; i += BLOCK_THREADS) {
+    blockHist[i] = 0;
+  }
+  __syncthreads();
+
+  vec_t<T, VEC_SIZE> dataIn_vec;
+  const int taskLen = taskLenPtr[taskId];
+
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
+      dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        const int binId = getBinId<LEFT, RIGHT>(dataIn_vec[j]);
+        atomicAdd(&blockHist[binId], 1);
+      }
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int i = tx; i < histLen; i += BLOCK_THREADS) {
+    // TODO : Optimize it with vec load
+    if (blockHist[i] > 0) {
+      atomicAdd(&histPtr[histLen * taskId + i], blockHist[i]);
+    }
+  }
+  return;
+}
+
+template <uint32_t BLOCK_THREADS>
+struct SelectBinTempStorage {
+  union {
+    typename cub::BlockScan<int, BLOCK_THREADS>::TempStorage scan;
+  } block_prim;
+};
+
+// TODO: implement with cub::BlockScan
+template <int BLOCK_THREADS, int HISTLEN>
+__global__ void __launch_bounds__(1024)
+    selectBinKernel(const int* histPtr, int* binIdPtr, int* kPtr, int* taskLenPtr) {
+  static_assert(HISTLEN % BLOCK_THREADS == 0, "HISTLEN % BLOCK_THREADS != 0");
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  const int taskId = bx;
+  const int taskLen = taskLenPtr[taskId];
+  const int UNROLL = HISTLEN / BLOCK_THREADS;
+
+  int count[UNROLL];
+  int thread_sum = 0;
+  int oldK = kPtr[taskId];
+  using TempStorage = SelectBinTempStorage<BLOCK_THREADS>;
+  extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<TempStorage&>(smem);
+
+#pragma unroll
+  for (int i = 0; i < UNROLL; i++) {
+    count[i] = histPtr[taskId * HISTLEN + tx * UNROLL + i];
+    thread_sum += count[i];
+  }
+  __syncthreads();
+
+  // Compute PrefixSum
+  int exclusive_prefix_sum = 0;
+  int block_sum = 0;
+  cub::BlockScan<int, BLOCK_THREADS>(temp_storage.block_prim.scan)
+      .ExclusiveSum(thread_sum, exclusive_prefix_sum, block_sum);
+  __syncthreads();
+
+  int inclusive_suffix_sum = block_sum - exclusive_prefix_sum;
+  int exclusive_suffix_sum = inclusive_suffix_sum - thread_sum;
+
+  if (oldK > exclusive_suffix_sum && oldK <= inclusive_suffix_sum) {
+    oldK -= exclusive_suffix_sum;
+
+#pragma unroll
+    for (int i = UNROLL - 1; i >= 0; i--) {
+      if (count[i] >= oldK) {
+        binIdPtr[taskId] = tx * UNROLL + i;
+        kPtr[taskId] = oldK;
+        taskLenPtr[taskId] = count[i];
+        break;
+      }
+      oldK -= count[i];
+    }
+  }
+  return;
+}
+
+// TODO:
+// 1. Optimize it with double Block Buffer
+// 2. Optimize it with vectorize read&write
+template <int BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T>
+__global__ void __launch_bounds__(1024)
+    selectCandidateKernel(T* dataIn, T* dataOut, int* globalCountPtr, const int* binIdPtr,
+                          const int* taskLenPtr, const int stride) {
+  using CompT = typename ComputeT<T>::type;
+  const int bx = blockIdx.x, tx = threadIdx.x;
+  const int taskId = bx;
+  const int taskLen = taskLenPtr[taskId];
+  const int mask = binIdPtr[taskId];
+  vec_t<T, VEC_SIZE> dataIn_vec;
+  // printf("taskLen: %d, BLOCK_THREADS: %d, VECS_ZE: %d\n", taskLen, BLOCK_THREADS, VEC_SIZE);
+  // TODO: handle taskLen % VEC_SIZE != 0
+
+  __shared__ int blockCount[1];
+  __shared__ T blockCache[BLOCK_THREADS * VEC_SIZE];
+
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
+    if (tx == 0) {
+      blockCount[0] = 0;
+    }
+    __syncthreads();
+
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
+      dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        T data = dataIn_vec[j];
+        const int binId = getBinId<LEFT, RIGHT>(data);
+        if (binId == mask) {
+          int pos = atomicAdd(blockCount, 1);
+          blockCache[pos] = data;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Write back blockCount/blockCache to globalCount/dataOut if blockCount
+    // Optimize it with double buffer
+    int count = blockCount[0];
+    __syncthreads();
+
+    if (count > 0 && tx == 0) {
+      // printf("count: %d, globalcount: %d\n", count, globalCountPtr[taskId]);
+      blockCount[0] = atomicAdd(globalCountPtr + taskId, count);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      if (tx * VEC_SIZE + j < count) {
+        dataOut[taskId * stride + blockCount[0] + tx * VEC_SIZE + j] =
+            blockCache[tx * VEC_SIZE + j];
+      }
+    }
+  }
+  return;
+}
+
+/*
+workSpace 起始地址
+│
+├─ valBuffer[0] ────────────────────── CompT类型，大小：taskNum × d
+│   (第一个值缓冲区)
+│
+├─ valBuffer[1] ────────────────────── CompT类型，大小：taskNum × d
+│   (第二个值缓冲区)
+│
+├─ histPtr ─────────────────────────── int类型，大小：(1 << 12) × taskNum = 4096 × taskNum
+│   (直方图缓冲区)                        (每个task有4096个bin的直方图)
+│
+├─ globalCountPtr ──────────────────── int类型，大小：taskNum
+│   (全局计数器)
+│
+├─ taskLenPtr[0] ───────────────────── int类型，大小：taskNum
+│   (旧任务长度数组)
+│
+├─ taskLenPtr[1] ───────────────────── int类型，大小：taskNum
+│   (新任务长度数组)
+│
+├─ kPtr ────────────────────────────── int类型，大小：taskNum
+│   (K值数组)
+│
+└─ binIdPtr ────────────────────────── int类型，大小：taskNum
+    (bin ID数组)
+*/
+// TODO: FINISH IT, Largest top-k
+template <typename T, typename IdType>
+cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
+                                  uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+                                  cudaStream_t stream = 0) {
+  // TODO: Remove TORCH_CHECK into sampling.cu
+  TORCH_CHECK(top_k_arr == nullptr, "Don't support top_k_arr currently");
+
+  using CompT = typename ComputeT<T>::type;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  auto compute_capacity = GetCudaComputeCapability();
+
+  size_t workSpaceSize = 0;
+  getRadixSelectWorkSpaceSize<T>(top_k_val, d, batch_size, &workSpaceSize);
+  void* workSpace = 0;
+  auto const cu_malloc_status = cudaMalloc(&workSpace, workSpaceSize);
+  TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate workspace for RadiK Sampling.");
+
+  CompT* valBuffer[2]{static_cast<CompT*>(workSpace),
+                      static_cast<CompT*>(workSpace) + batch_size * d};
+  int* histPtr = reinterpret_cast<int*>(valBuffer[1] + batch_size * d);
+  int* globalCountPtr = histPtr + (1 << 12) * batch_size;
+
+  // set taskLenPtr, zero-init
+  // TODO: Why zero-init, instead of init it with correct initial task len(equal to d here)
+  int* taskLenPtr[2]{globalCountPtr + batch_size, globalCountPtr + 2 * batch_size};
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(taskLenPtr[0], 0, sizeof(int) * 2 * batch_size, stream));
+  std::vector<int> tmpTaskLen(2 * batch_size, d);
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
+                                       sizeof(int) * batch_size * 2, cudaMemcpyDefault, stream));
+
+  // set kPtr
+  int* kPtr = taskLenPtr[1] + batch_size;
+  std::vector<int> tmpK(batch_size, top_k_val);
+  FLASHINFER_CUDA_CALL(
+      cudaMemcpyAsync(kPtr, tmpK.data(), sizeof(int) * batch_size, cudaMemcpyDefault, stream));
+
+  // set binIdPtr
+  int* binIdPtr = kPtr + batch_size;
+
+  // blockSize=1024
+  // set gridSize
+
+  //   std::vector<int> taskLenHost(batch_size, d);
+  // clear hist and globalCount
+  FLASHINFER_CUDA_CALL(
+      cudaMemsetAsync(histPtr, 0, sizeof(int) * batch_size * ((1 << 12) + 1), stream));
+
+  DISPATCH_COMPUTE_CAP_NUM_THREADS(
+      compute_capacity, BLOCK_THREADS, {DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+        // iter1: countBin
+        dim3 countbin_iter1_nblks(batch_size);
+        dim3 countbin_iter1_nthrs(BLOCK_THREADS);
+
+        auto countbin_iter1_kernel = countBinKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T>;
+        void* countbin_iter1_args[] = {&probs, &taskLenPtr[0], &histPtr, &d, &batch_size};
+
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter1_kernel, countbin_iter1_nblks,
+                                              countbin_iter1_nthrs, countbin_iter1_args, 0,
+                                              stream));
+
+        // iter1: selectBin
+        dim3 selectbin_iter1_nblks(batch_size);
+        dim3 selectbin_iter1_nthrs(BLOCK_THREADS);
+        size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
+
+        auto selectbin_iter1_kernel = selectBinKernel<BLOCK_THREADS, (1 << 12)>;
+        void* selectbin_iter1_args[] = {&histPtr, &binIdPtr, &kPtr, &taskLenPtr[0]};
+
+        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+            selectbin_iter1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter1_kernel, selectbin_iter1_nblks,
+                                              selectbin_iter1_nthrs, selectbin_iter1_args,
+                                              smem_size, stream));
+
+        // iter1: selectCandidate
+        dim3 selectcan_iter1_nblks(batch_size);
+        dim3 selectcan_iter1_nthrs(BLOCK_THREADS);
+
+        auto selectcan_iter1_kernel = selectCandidateKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T>;
+        void* selectcan_iter1_args[] = {&probs,    &valBuffer[0],  &globalCountPtr,
+                                        &binIdPtr, &taskLenPtr[1], &d};
+
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter1_kernel, selectcan_iter1_nblks,
+                                              selectcan_iter1_nthrs, selectcan_iter1_args, 0,
+                                              stream));
+      })});
+
+  // check global histgram
+  // 等待GPU kernel执行完成
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+
+  // 分配CPU内存来存储第一个任务的histogram
+  std::vector<int> host_histogram(1 << 12, 0);  // 4096个元素
+
+  // // 将第一个任务的histogram从GPU复制到CPU
+  FLASHINFER_CUDA_CALL(
+      cudaMemcpy(host_histogram.data(), histPtr, sizeof(int) * (1 << 12), cudaMemcpyDeviceToHost));
+  // 打印第一个任务的histogram
+  printf("=== Task 0 Histogram ===\n");
+  int total_count = 0;
+  int non_zero_bins = 0;
+  for (uint32_t i = 0; i < (1 << 12); i++) {
+    if (host_histogram[i] > 0) {
+      printf("Bin[%u]: %d\n", i, host_histogram[i]);
+      total_count += host_histogram[i];
+      non_zero_bins++;
+    }
+  }
+  printf("Total count: %d, Non-zero bins: %d\n", total_count, non_zero_bins);
+
+  std::vector<int> host_binId(batch_size);
+  std::vector<int> host_k(batch_size);
+  std::vector<int> host_taskLen(batch_size);
+
+  // 复制结果到 CPU
+  cudaMemcpy(host_binId.data(), binIdPtr, sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(host_k.data(), kPtr, sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(host_taskLen.data(), taskLenPtr, sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
+
+  // 验证第一个任务的结果
+  printf("=== SelectBin Results for Task 0 ===\n");
+  printf("Selected bin ID: %d\n", host_binId[0]);
+  printf("Updated k: %d\n", host_k[0]);
+  printf("Bin count: %d\n", host_taskLen[0]);
+
+  // 添加 globalCount 结果的复制和打印
+  std::vector<int> host_globalCount(batch_size);
+  cudaMemcpy(host_globalCount.data(), globalCountPtr, sizeof(int) * batch_size,
+             cudaMemcpyDeviceToHost);
+
+  // 打印 globalCount 结果
+  printf("=== GlobalCount Results ===\n");
+  for (int i = 0; i < batch_size; i++) {
+    printf("Task[%d] globalCount: %d\n", i, host_globalCount[i]);
+  }
+
   return cudaSuccess;
 }
 

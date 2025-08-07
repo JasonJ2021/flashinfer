@@ -279,3 +279,29 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
+
+
+void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
+                               std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               std::optional<at::Generator> gen_) {
+  CHECK_INPUT(probs);
+  CHECK_INPUT(output);
+  auto device = probs.device();
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
+  CHECK_DIM(1, output);  // output: (batch_size)
+  unsigned int batch_size = output.size(0);
+  unsigned int vocab_size = probs.size(1);
+  bool has_top_k_arr = maybe_top_k_arr.has_value();
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t status = sampling::RadiKSamplingFromProb<float, int>(
+      static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
+      top_k_val, vocab_size, stream);
+  TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
+                                         std::string(cudaGetErrorString(status)));
+}

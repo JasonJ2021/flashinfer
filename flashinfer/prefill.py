@@ -88,7 +88,12 @@ def get_fmha_module(
 @functools.cache
 def get_single_prefill_module(backend, *args):
     uri = get_single_prefill_uri(backend, *args)
+    import time
+    # Compiling Starts
+    compile_start_ms = time.time() * 1e3
     module = gen_single_prefill_module(backend, *args).build_and_load()
+    compile_end_ms = time.time() * 1e3
+    print("Compiling Single-Prefill Kernel takes: ", compile_end_ms - compile_start_ms, "ms")
     run_func = module.run.default
 
     # torch library for single_prefill_with_kv_cache
