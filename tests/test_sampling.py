@@ -566,6 +566,12 @@ def test_radik_sampling(batch_size, vocab_size, k):
     num_trails = 1
     for _ in range(num_trails):
         samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
+        target_samples = torch.topk(normalized_prob, k)
+        print("radik_sampling_from_probs", samples)
+        torch.set_printoptions(precision=10)
+        print("torch_sampling_from_probs", target_samples)
+        # print("top-k sample:", target_samples.values[0][k - 1])
+
         # Uncomment me to check the correctness of the sampling
         # assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         # assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
@@ -586,4 +592,4 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
-    test_radik_sampling(1, 32000, 1000)
+    test_radik_sampling(1, 32000, 10)
