@@ -529,7 +529,7 @@ def test_chain_speculative_sampling(
                     # mismatch_idx should be contiguous
                     assert torch.all(mismatch_idx[1:] == mismatch_idx[:-1] + 1)
                     # from the second mismatched token on, the output tokens should be -1
-                    assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
+                    assert torch.all(output_token_ids[row, mismatch_idx[0] + 1:] == -1)
 
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
         batch_indices = torch.arange(batch_size, device=normalized_draft_prob.device)[
@@ -546,27 +546,46 @@ def test_chain_speculative_sampling(
         ]
 
 
+def gumbel_distribution(beta):
+    def gumbel_noise(shape, device):
+        U = torch.rand(shape, device=device)
+        eps = 1e-20
+        return torch.log(-torch.log(U + eps) + eps) / beta
+
+    gumbel_noise.__name__ = f"gumbel_distribution(beta={beta})"
+    return gumbel_noise
+
+def normal_distribution(std):
+    def normal_noise(shape, device):
+        return torch.randn(shape, device=device) * std
+
+    normal_noise.__name__ = f"normal_distribution(std={std})"
+    return normal_noise
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_radik_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
+
+    logits = gumbel_distribution(0.1)((batch_size, vocab_size), device="cuda")
+    probs = torch.softmax(logits, dim=-1)
+
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+    # pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    # normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    # sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    # pivot = sorted_prob[:, k - 1]
+    # mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
 
     # TEMP:
     # normalized_prob = torch.ones_like(normalized_prob)
-    
 
     num_trails = 1
     for _ in range(num_trails):
-        samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
-        target_samples = torch.topk(normalized_prob, k)
+        samples = flashinfer.sampling.radik_sampling_from_probs(probs, k)
+        target_samples = torch.topk(probs, k)
         print("radik_sampling_from_probs", samples)
         torch.set_printoptions(precision=10)
         print("torch_sampling_from_probs", target_samples)
@@ -577,6 +596,7 @@ def test_radik_sampling(batch_size, vocab_size, k):
         # assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
         #     torch.arange(batch_size), samples
         # ]
+
 
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
@@ -592,4 +612,5 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
-    test_radik_sampling(1, 32000, 10)
+    # test_radik_sampling(256, 128512, 1000)
+    test_radik_sampling(32, 128512, 5)

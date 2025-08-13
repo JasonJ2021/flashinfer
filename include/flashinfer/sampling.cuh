@@ -2329,7 +2329,7 @@ __global__ void __launch_bounds__(1024)
   __shared__ int blockCount[1];
   __shared__ float blockCache[BLOCK_THREADS];
 
-  const int taskId = threadIdx.y;
+  const int taskId = blockIdx.y;
   const int taskLen = taskLenPtr[taskId];
   const int mask = binIdPtr[taskId];
   int idx = blockIdx.x * BLOCK_THREADS + threadIdx.x;
@@ -2341,9 +2341,8 @@ __global__ void __launch_bounds__(1024)
 
   if (idx < taskLen) {
     float data = dataIn[taskId * stride + idx];
-    printf("selectCandidate data: %.14f\n", data);
     if (mask == getBinId<LEFT, RIGHT>(data)) {
-      printf("select top-k candidate data: %.14f\n", data);
+      // printf("select task%d top-k candidate data: %.14f\n", taskId, data);
       int pos = atomicAdd(blockCount, 1);
       blockCache[pos] = data;
     }
@@ -2440,10 +2439,15 @@ __global__ void __launch_bounds__(1024)
   const int tx = threadIdx.x, bx = blockIdx.x;
   const int taskId = bx;
   const int taskLen = taskLenPtr[taskId];
-  const int k = kPtr[taskId];
+  // const int k = kPtr[taskId];
+
+  if (tx == 0) {
+    blockCount[0] = 0;
+  }
+  __syncthreads();
 
   vec_t<ValType, VEC_SIZE> dataIn_vec;
-  if (taskLen < k) {
+  if (taskLen < K) {
     // N <= K, copy all
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
@@ -2461,6 +2465,7 @@ __global__ void __launch_bounds__(1024)
     // N > K, filter by k-th element
     const CompT kThElem = *(kThElePtr + taskId * stride);
     // printf("kThElem: %.10f\n", kThElem);
+
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
@@ -2468,14 +2473,29 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; j++) {
           if (dataIn_vec[j] > kThElem) {
-            // printf("filter data: %.14f\n", dataIn_vec[j]);
+            // TODO: BUG, pos can be larger than CACHE_SIZE
             int pos = atomicAdd(blockCount, 1);
-            valBlockCache[pos] = dataIn_vec[j];
-            idxBlockCache[pos] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-          } else if (dataIn_vec[j] == kThElem) {
-            if (atomicSub(&kPtr[taskId], 1) > 0) {
-              // printf("filter data: %.14f\n", dataIn_vec[j]);
-              int pos = atomicAdd(blockCount, 1);
+            if (pos < K) {
+              valBlockCache[pos] = dataIn_vec[j];
+              idxBlockCache[pos] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+            }
+          }
+        }
+      }
+    }
+
+    // select top-k elements, it can be wrong if select top-k and element which larger than
+    // top - k element simultaneously
+#pragma unroll 2
+    for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
+        dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; j++) {
+          if (dataIn_vec[j] == kThElem) {
+            // printf("task%d filter data: %.14f\n", taskId, dataIn_vec[j]);
+            int pos = atomicAdd(blockCount, 1);
+            if (pos < K) {
               valBlockCache[pos] = dataIn_vec[j];
               idxBlockCache[pos] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
             }
@@ -2486,23 +2506,10 @@ __global__ void __launch_bounds__(1024)
   }
   __syncthreads();
 
-  // FlushCache
-  // TODO: Multiple blocks handle one task, uncomment below
-  // int count = blockCount[0];
-  // __syncthreads();
-
-  // if (tx == 0) {
-  //   blockCount[0]=  atomicAdd(globalCount[taskId], count);
-  // }
-  // const int offset = blockCount[0];
-  // __syncthreads();
-
-  // const int write_base = taskId * K + offset;
-
-#pragma unroll
-  for (int i = tx; i < K; i += BLOCK_THREADS) {
-    valOut[i] = valBlockCache[i];
-    idxOut[i] = idxBlockCache[i];
+  // Note: BlockCount[0] can be large than K, because of the k-th element is not unique
+  for (int i = tx; i < std::min(K, blockCount[0]); i += BLOCK_THREADS) {
+    valOut[taskId * K + i] = valBlockCache[i];
+    idxOut[taskId * K + i] = idxBlockCache[i];
   }
 
   return;
@@ -2605,7 +2612,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
                                               stream));
 
         // iter1: selectBin
-        printf("=== First iter ===\n");
+        // printf("=== First iter ===\n");
         dim3 selectbin_iter1_nblks(batch_size);
         dim3 selectbin_iter1_nthrs(BLOCK_THREADS);
         size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
@@ -2640,7 +2647,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
         FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
         int maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
         if (maxTaskLen != 1) {
-          printf("=== Second iter ===\n");
+          // printf("=== Second iter ===\n");
           // clear hist and globalCount
           FLASHINFER_CUDA_CALL(
               cudaMemsetAsync(histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
@@ -2693,9 +2700,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
         // third iter
         FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
         maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
-        printf("Before third iter maxTaskLen: %d\n", maxTaskLen);
+        // printf("Before third iter maxTaskLen: %d\n", maxTaskLen);
         if (maxTaskLen != 1) {
-          printf("=== Third iter ===\n");
+          // printf("=== Third iter ===\n");
           // clear hist and globalCount
           // TODO: optimize memory usage, histPtr needs smaller memory
           // int* new_histPtr = histPtr + 3840 * batch_size;
@@ -2797,7 +2804,8 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
 
   // // 将第一个任务的histogram从GPU复制到CPU
   FLASHINFER_CUDA_CALL(
-      cudaMemcpy(host_histogram.data(), histPtr, sizeof(int) * (1 << 12), cudaMemcpyDeviceToHost));
+      cudaMemcpy(host_histogram.data(), histPtr, sizeof(int) * (1 << 12),
+      cudaMemcpyDeviceToHost));
   // 打印第一个任务的histogram
   printf("=== Task 0 Histogram ===\n");
   int total_count = 0;
@@ -2818,13 +2826,16 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   // 复制结果到 CPU
   cudaMemcpy(host_binId.data(), binIdPtr, sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
   cudaMemcpy(host_k.data(), kPtr, sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
-  cudaMemcpy(host_taskLen.data(), taskLenPtr[1], sizeof(int) * batch_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(host_taskLen.data(), taskLenPtr[1], sizeof(int) * batch_size,
+  cudaMemcpyDeviceToHost);
 
   // 验证第一个任务的结果
-  printf("=== SelectBin Results for Task 0 ===\n");
-  printf("Selected bin ID: %d\n", host_binId[0]);
-  printf("Updated k: %d\n", host_k[0]);
-  printf("Bin count: %d\n", host_taskLen[0]);
+  for (int task_idx = 0; task_idx < batch_size; task_idx++) {
+    printf("=== SelectBin Results for Task %d ===\n", task_idx);
+    printf("Selected bin ID: %d\n", host_binId[task_idx]);
+    printf("Updated k: %d\n", host_k[task_idx]);
+    printf("Bin count: %d\n", host_taskLen[task_idx]);
+  }
 
   // 添加 globalCount 结果的复制和打印
   std::vector<int> host_globalCount(batch_size);
@@ -2862,6 +2873,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
 
   // ... existing code ...
 
+  FLASHINFER_CUDA_CALL(cudaFree(workSpace))
   return cudaSuccess;
 }  // namespace sampling
 

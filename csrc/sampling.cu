@@ -294,6 +294,7 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
+  // printf("batch_size: %d, vocab_size: %d, top_k_val: %ld\n", batch_size, vocab_size, top_k_val);
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -302,6 +303,6 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
       top_k_val, vocab_size, stream);
-  TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
+  TORCH_CHECK(status == cudaSuccess, "RadiKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
