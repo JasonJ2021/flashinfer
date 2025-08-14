@@ -294,7 +294,14 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
-  // printf("batch_size: %d, vocab_size: %d, top_k_val: %ld\n", batch_size, vocab_size, top_k_val);
+
+  uint64_t philox_seed, philox_offset;
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      gen_, at::cuda::detail::getDefaultCUDAGenerator());
+  std::lock_guard<std::mutex> lock(gen->mutex_);
+  at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(32 * batch_size);
+  philox_seed = rng_engine_inputs.seed_.val;
+  philox_offset = rng_engine_inputs.offset_.val;
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -302,7 +309,7 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+      top_k_val, vocab_size, philox_seed, philox_offset, stream);
   TORCH_CHECK(status == cudaSuccess, "RadiKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }

@@ -546,56 +546,52 @@ def test_chain_speculative_sampling(
         ]
 
 
-def gumbel_distribution(beta):
-    def gumbel_noise(shape, device):
-        U = torch.rand(shape, device=device)
-        eps = 1e-20
-        return torch.log(-torch.log(U + eps) + eps) / beta
-
-    gumbel_noise.__name__ = f"gumbel_distribution(beta={beta})"
-    return gumbel_noise
-
-def normal_distribution(std):
-    def normal_noise(shape, device):
-        return torch.randn(shape, device=device) * std
-
-    normal_noise.__name__ = f"normal_distribution(std={std})"
-    return normal_noise
-
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+def test_radik_top_k_sampling(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
 def test_radik_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
-
-    logits = gumbel_distribution(0.1)((batch_size, vocab_size), device="cuda")
-    probs = torch.softmax(logits, dim=-1)
-
     torch.manual_seed(42)
-    # pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    # normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    # sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    # pivot = sorted_prob[:, k - 1]
-    # mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-
-    # TEMP:
-    # normalized_prob = torch.ones_like(normalized_prob)
+    torch.set_printoptions(precision=14)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
 
     num_trails = 1
     for _ in range(num_trails):
-        samples = flashinfer.sampling.radik_sampling_from_probs(probs, k)
-        target_samples = torch.topk(probs, k)
-        print("radik_sampling_from_probs", samples)
-        torch.set_printoptions(precision=10)
-        print("torch_sampling_from_probs", target_samples)
-        # print("top-k sample:", target_samples.values[0][k - 1])
+        samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
+        if not torch.all(mask[torch.arange(batch_size), samples] == 1):
+            task_id = torch.nonzero(mask[torch.arange(batch_size), samples] == 0, as_tuple=True)[0]
+            print(mask[torch.arange(batch_size), samples])
+            print(f"Task{task_id} sampling incorrect, top-k pivot: {pivot[task_id]}")
 
         # Uncomment me to check the correctness of the sampling
-        # assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
-        # assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
-        #     torch.arange(batch_size), samples
-        # ]
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
 
 
 if __name__ == "__main__":
@@ -613,4 +609,9 @@ if __name__ == "__main__":
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
     # test_radik_sampling(256, 128512, 1000)
-    test_radik_sampling(32, 128512, 5)
+
+    # Test misaligned
+    # test_radik_sampling(1, 128512, 10)
+
+    # Test incorrect
+    test_radik_sampling(10, 128256, 10)
