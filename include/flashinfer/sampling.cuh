@@ -2594,6 +2594,7 @@ template <typename T, typename IdType>
 cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
                                   uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                   uint64_t philox_seed, uint64_t philox_offset,
+                                  void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
                                   cudaStream_t stream = 0) {
   // TODO: Remove TORCH_CHECK into sampling.cu
   TORCH_CHECK(top_k_arr == nullptr, "Don't support top_k_arr currently");
@@ -2606,7 +2607,13 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   size_t workSpaceSize = 0;
   getRadixSelectWorkSpaceSize<T, IdType>(top_k_val, d, batch_size, &workSpaceSize);
   void* workSpace = 0;
-  auto const cu_malloc_status = cudaMalloc(&workSpace, workSpaceSize);
+  bool workspace_allocated = false;
+  if (workSpaceSize > workspace_buffer_size_in_bytes) {
+    FLASHINFER_CUDA_CALL(cudaMalloc(&workSpace, workSpaceSize));
+    workspace_allocated = true;
+  } else {
+    workSpace = workspace_buffer;
+  }
 
   CompT* valBuffer[2]{static_cast<CompT*>(workSpace),
                       static_cast<CompT*>(workSpace) + batch_size * d};
@@ -2616,8 +2623,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   // set taskLenPtr, zero-init
   // TODO: Why zero-init, instead of init it with correct initial task len(equal to d here)
   int* taskLenPtr[2]{globalCountPtr + batch_size, globalCountPtr + 2 * batch_size};
-  FLASHINFER_CUDA_CALL(cudaMemsetAsync(taskLenPtr[0], 0, sizeof(int) * 2 * batch_size, stream));
   std::vector<int> tmpTaskLen(2 * batch_size, d);
+
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(taskLenPtr[0], 0, sizeof(int) * 2 * batch_size, stream));
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
                                        sizeof(int) * batch_size * 2, cudaMemcpyDefault, stream));
 
@@ -2638,7 +2646,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   // blockSize=1024
   // set gridSize
 
-  // std::vector<int> taskLenHost(batch_size, d);
   // clear hist and globalCount
   FLASHINFER_CUDA_CALL(
       cudaMemsetAsync(histPtr, 0, sizeof(int) * batch_size * ((1 << 12) + 1), stream));
@@ -2646,7 +2653,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       // iter1: countBin
-      // dim3 countbin_iter1_nblks((d + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+    //   dim3 countbin_iter1_nblks((d + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
       dim3 countbin_iter1_nblks(batch_size);
       dim3 countbin_iter1_nthrs(BLOCK_THREADS);
 
@@ -2793,9 +2800,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
                                               selectcan_iter3_nthrs, selectcan_iter3_args, 0,
                                               stream));
 
-        // update taskLen
-        FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenHost.data(), taskLenPtr[flag ^ 1],
-                                             sizeof(int) * batch_size, cudaMemcpyDefault, stream));
         flag ^= 1;
       }
       // clear globalCount
@@ -2933,8 +2937,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   //     printf("  ... (showing first 10 of %d results)\n", top_k_val);
   //   }
   // }
-
-  FLASHINFER_CUDA_CALL(cudaFree(workSpace))
+  if (workspace_allocated) {
+    FLASHINFER_CUDA_CALL(cudaFree(workSpace))
+  }
   return cudaSuccess;
 }  // namespace sampling
 

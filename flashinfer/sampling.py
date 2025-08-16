@@ -214,8 +214,9 @@ def get_sampling_module():
         )
         return samples
 
-    @register_custom_op("flashinfer::radik_sampling_from_probs", mutates_args=())
+    @register_custom_op("flashinfer::radik_sampling_from_probs", mutates_args=("workspace_buffer",))
     def radik_sampling_from_probs(
+        workspace_buffer: torch.Tensor,
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
         maybe_top_k_arr: Optional[torch.Tensor],
@@ -228,6 +229,7 @@ def get_sampling_module():
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
         module.radik_sampling_from_probs.default(
+            workspace_buffer,
             probs,
             samples,
             indices,
@@ -236,7 +238,6 @@ def get_sampling_module():
             generator,
         )
         return samples
-
 
     @register_fake_op("flashinfer::top_k_sampling_from_probs")
     def _fake_top_k_sampling_from_probs(
@@ -834,7 +835,6 @@ def top_k_sampling_from_probs(
     )
 
 
-
 def radik_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -875,9 +875,19 @@ def radik_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    # 32MB => FlashInfer在 36 / 84 个测试中表现更好
+    # 64MB => FlashInfer在 33 / 84 个测试中表现更好
+    # 128MB => FlashInfer在 29 / 84 个测试中表现更好
+    # 256MB => FlashInfer在 13 / 60 个测试中表现更好
+    # 512MB => FlashInfer在 15 / 84 个测试中表现更好
+    # 1280MB => FlashInfer在 15 / 84 个测试中表现更好
+
+    workspace_buffer = _get_cache_buf("radik_sampling_from_probs_workspace", 64 * 1024 * 1024, probs.device)
+
     return get_sampling_module().radik_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(top_k), generator
+        workspace_buffer, probs, indices, *_to_tensor_scalar_tuple(top_k), generator
     )
+
 
 def min_p_sampling_from_probs(
     probs: torch.Tensor,

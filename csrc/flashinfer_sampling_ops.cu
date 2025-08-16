@@ -63,8 +63,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
                                 at::Tensor output_emitted_draft_token_num, bool deterministic,
                                 std::optional<at::Generator> gen);
 
-
-void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
+void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                                std::optional<at::Generator> gen);

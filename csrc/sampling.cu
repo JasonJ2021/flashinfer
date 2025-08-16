@@ -280,11 +280,11 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
                                          std::string(cudaGetErrorString(status)));
 }
 
-
-void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
+void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                                std::optional<at::Generator> gen_) {
+  CHECK_INPUT(workspace_buffer);
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   auto device = probs.device();
@@ -293,6 +293,7 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
   CHECK_DIM(1, output);  // output: (batch_size)
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   uint64_t philox_seed, philox_offset;
@@ -309,7 +310,8 @@ void radik_sampling_from_probs(at::Tensor probs, at::Tensor output,
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, philox_seed, philox_offset, stream);
+      top_k_val, vocab_size, philox_seed, philox_offset, workspace_buffer.data_ptr(),
+      workspace_buffer.element_size() * workspace_buffer.size(0), stream);
   TORCH_CHECK(status == cudaSuccess, "RadiKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
