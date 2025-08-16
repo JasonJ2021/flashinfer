@@ -2226,7 +2226,7 @@ __global__ void __launch_bounds__(1024)
                      const int taskNum) {
   using CompT = typename ComputeT<T>::type;
   const int bx = blockIdx.x, tx = threadIdx.x;
-  const int taskId = bx;
+  const int taskId = blockIdx.y;
 
   constexpr int histLen = 1 << (8 * sizeof(CompT) - RIGHT);
   __shared__ int blockHist[histLen];
@@ -2238,15 +2238,12 @@ __global__ void __launch_bounds__(1024)
   vec_t<T, VEC_SIZE> dataIn_vec;
   const int taskLen = taskLenPtr[taskId];
 
-#pragma unroll 2
-  for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-      dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+  if ((bx * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
+    dataIn_vec.cast_load(dataIn + taskId * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; j++) {
-        const int binId = getBinId<LEFT, RIGHT>(dataIn_vec[j]);
-        atomicAdd(&blockHist[binId], 1);
-      }
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      const int binId = getBinId<LEFT, RIGHT>(dataIn_vec[j]);
+      atomicAdd(&blockHist[binId], 1);
     }
   }
   __syncthreads();
@@ -2653,8 +2650,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       // iter1: countBin
-    //   dim3 countbin_iter1_nblks((d + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
-      dim3 countbin_iter1_nblks(batch_size);
+      dim3 countbin_iter1_nblks((d + BLOCK_THREADS + VEC_SIZE - 1) / (BLOCK_THREADS + VEC_SIZE),
+                                batch_size);
+      //   dim3 countbin_iter1_nblks(batch_size);
       dim3 countbin_iter1_nthrs(BLOCK_THREADS);
 
       // auto countbin_iter1_kernel = countBinKernel<BLOCK_THREADS, 0, 20, T>;
@@ -2817,6 +2815,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   } while (0)
 
       // Apply top-k filter
+      //   dim3 filter_nblks((d + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
       dim3 filter_nblks(batch_size);
       dim3 filter_nthrs(BLOCK_THREADS);
       void* filter_args[] = {&probs,
