@@ -2369,7 +2369,7 @@ __global__ void __launch_bounds__(1024)
                             const int* taskLenPtr, const int stride) {
   using CompT = typename ComputeT<T>::type;
   const int bx = blockIdx.x, tx = threadIdx.x;
-  const int taskId = bx;
+  const int taskId = blockIdx.y;
   const int taskLen = taskLenPtr[taskId];
   const int mask = binIdPtr[taskId];
   vec_t<T, VEC_SIZE> dataIn_vec;
@@ -2380,43 +2380,40 @@ __global__ void __launch_bounds__(1024)
   __shared__ T blockCache[BLOCK_THREADS * VEC_SIZE];
 
 #pragma unroll 2
-  for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
-    if (tx == 0) {
-      blockCount[0] = 0;
-    }
-    __syncthreads();
+  if (tx == 0) {
+    blockCount[0] = 0;
+  }
+  __syncthreads();
 
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-      dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; j++) {
-        T data = dataIn_vec[j];
-        const int binId = getBinId<LEFT, RIGHT>(data);
-        if (binId == mask) {
-          int pos = atomicAdd(blockCount, 1);
-          blockCache[pos] = data;
-        }
-      }
-    }
-    __syncthreads();
-
-    // Write back blockCount/blockCache to globalCount/dataOut if blockCount
-    // Optimize it with double buffer
-    int count = blockCount[0];
-    __syncthreads();
-
-    if (count > 0 && tx == 0) {
-      // printf("count: %d, globalcount: %d\n", count, globalCountPtr[taskId]);
-      blockCount[0] = atomicAdd(globalCountPtr + taskId, count);
-    }
-    __syncthreads();
-
+  if ((bx * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
+    dataIn_vec.cast_load(dataIn + taskId * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      if (tx * VEC_SIZE + j < count) {
-        dataOut[taskId * stride + blockCount[0] + tx * VEC_SIZE + j] =
-            blockCache[tx * VEC_SIZE + j];
+      T data = dataIn_vec[j];
+      const int binId = getBinId<LEFT, RIGHT>(data);
+      if (binId == mask) {
+        int pos = atomicAdd(blockCount, 1);
+        blockCache[pos] = data;
       }
+    }
+  }
+  __syncthreads();
+
+  // Write back blockCount/blockCache to globalCount/dataOut if blockCount
+  // Optimize it with double buffer
+  int count = blockCount[0];
+  __syncthreads();
+
+  if (count > 0 && tx == 0) {
+    // printf("count: %d, globalcount: %d\n", count, globalCountPtr[taskId]);
+    blockCount[0] = atomicAdd(globalCountPtr + taskId, count);
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t j = 0; j < VEC_SIZE; j++) {
+    if (tx * VEC_SIZE + j < count) {
+      dataOut[taskId * stride + blockCount[0] + tx * VEC_SIZE + j] = blockCache[tx * VEC_SIZE + j];
     }
   }
   return;
@@ -2650,9 +2647,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       // iter1: countBin
-      dim3 countbin_iter1_nblks((d + BLOCK_THREADS + VEC_SIZE - 1) / (BLOCK_THREADS + VEC_SIZE),
+      dim3 countbin_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
                                 batch_size);
-      //   dim3 countbin_iter1_nblks(batch_size);
+      // dim3 countbin_iter1_nblks(batch_size);
       dim3 countbin_iter1_nthrs(BLOCK_THREADS);
 
       // auto countbin_iter1_kernel = countBinKernel<BLOCK_THREADS, 0, 20, T>;
@@ -2679,7 +2676,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
                                             stream));
 
       // iter1: selectCandidate
-      dim3 selectcan_iter1_nblks(batch_size);
+      dim3 selectcan_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
+                                 batch_size);
+      //   dim3 selectcan_iter1_nblks(batch_size);
       dim3 selectcan_iter1_nthrs(BLOCK_THREADS);
 
       auto selectcan_iter1_kernel = selectCandidateExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T>;
@@ -2816,6 +2815,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* 
 
       // Apply top-k filter
       //   dim3 filter_nblks((d + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+
       dim3 filter_nblks(batch_size);
       dim3 filter_nthrs(BLOCK_THREADS);
       void* filter_args[] = {&probs,
