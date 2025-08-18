@@ -214,7 +214,9 @@ def get_sampling_module():
         )
         return samples
 
-    @register_custom_op("flashinfer::radik_sampling_from_probs", mutates_args=("workspace_buffer",))
+    @register_custom_op(
+        "flashinfer::radik_sampling_from_probs", mutates_args=("workspace_buffer",)
+    )
     def radik_sampling_from_probs(
         workspace_buffer: torch.Tensor,
         probs: torch.Tensor,
@@ -882,7 +884,9 @@ def radik_sampling_from_probs(
     # 512MB => FlashInfer在 15 / 84 个测试中表现更好
     # 1280MB => FlashInfer在 15 / 84 个测试中表现更好
 
-    workspace_buffer = _get_cache_buf("radik_sampling_from_probs_workspace", 64 * 1024 * 1024, probs.device)
+    workspace_buffer = _get_cache_buf(
+        "radik_sampling_from_probs_workspace", 64 * 1024 * 1024, probs.device
+    )
 
     return get_sampling_module().radik_sampling_from_probs(
         workspace_buffer, probs, indices, *_to_tensor_scalar_tuple(top_k), generator
