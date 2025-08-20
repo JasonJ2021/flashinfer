@@ -223,6 +223,7 @@ def get_sampling_module():
         indices: Optional[torch.Tensor],
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        selected_probs: Optional[torch.Tensor],
         generator: Optional[torch.Generator],
     ) -> torch.Tensor:
         device = probs.device
@@ -237,6 +238,7 @@ def get_sampling_module():
             indices,
             maybe_top_k_arr,
             top_k_val,
+            selected_probs,
             generator,
         )
         return samples
@@ -842,6 +844,7 @@ def radik_sampling_from_probs(
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
+    selected_probs: Optional[torch.Tensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k sampling from probabilities,
@@ -889,7 +892,12 @@ def radik_sampling_from_probs(
     )
 
     return get_sampling_module().radik_sampling_from_probs(
-        workspace_buffer, probs, indices, *_to_tensor_scalar_tuple(top_k), generator
+        workspace_buffer,
+        probs,
+        indices,
+        *_to_tensor_scalar_tuple(top_k),
+        selected_probs,
+        generator,
     )
 
 

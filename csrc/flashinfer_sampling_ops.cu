@@ -66,6 +66,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
 void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               std::optional<at::Tensor> maybe_selected_probs,
                                std::optional<at::Generator> gen);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

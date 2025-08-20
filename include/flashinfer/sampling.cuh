@@ -2220,13 +2220,15 @@ __global__ void __launch_bounds__(1024)
   return;
 }
 
-template <uint32_t BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T>
+template <uint32_t BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T,
+          typename IdType>
 __global__ void __launch_bounds__(1024)
     countBinExKernel(const T* dataIn, const int* taskLenPtr, int* histPtr, const int stride,
-                     const int taskNum) {
+                     const int taskNum, IdType* indices) {
   using CompT = typename ComputeT<T>::type;
   const int bx = blockIdx.x, tx = threadIdx.x;
   const int taskId = blockIdx.y;
+  const int row_idx = indices == nullptr ? taskId : indices[taskId];
 
   constexpr int histLen = 1 << (8 * sizeof(CompT) - RIGHT);
   __shared__ int blockHist[histLen];
@@ -2239,7 +2241,7 @@ __global__ void __launch_bounds__(1024)
   const int taskLen = taskLenPtr[taskId];
 
   if ((bx * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-    dataIn_vec.cast_load(dataIn + taskId * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
+    dataIn_vec.cast_load(dataIn + row_idx * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       const int binId = getBinId<LEFT, RIGHT>(dataIn_vec[j]);
@@ -2363,15 +2365,17 @@ __global__ void __launch_bounds__(1024)
 // TODO:
 // 1. Optimize it with double Block Buffer
 // 2. Optimize it with vectorize read&write
-template <int BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T>
+template <int BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T, typename IdType>
 __global__ void __launch_bounds__(1024)
     selectCandidateExKernel(T* dataIn, T* dataOut, int* globalCountPtr, const int* binIdPtr,
-                            const int* taskLenPtr, const int stride) {
+                            const int* taskLenPtr, const int stride, IdType* indices) {
   using CompT = typename ComputeT<T>::type;
   const int bx = blockIdx.x, tx = threadIdx.x;
   const int taskId = blockIdx.y;
   const int taskLen = taskLenPtr[taskId];
   const int mask = binIdPtr[taskId];
+  const int row_idx = indices == nullptr ? taskId : indices[taskId];
+  //   printf("taskId: %d, row_idx: %d\n", taskId, row_idx);
   vec_t<T, VEC_SIZE> dataIn_vec;
   // printf("taskLen: %d, BLOCK_THREADS: %d, VECS_ZE: %d\n", taskLen, BLOCK_THREADS, VEC_SIZE);
   // TODO: handle taskLen % VEC_SIZE != 0
@@ -2386,7 +2390,7 @@ __global__ void __launch_bounds__(1024)
   __syncthreads();
 
   if ((bx * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-    dataIn_vec.cast_load(dataIn + taskId * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
+    dataIn_vec.cast_load(dataIn + row_idx * stride + (bx * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       T data = dataIn_vec[j];
@@ -2424,7 +2428,7 @@ __global__ void __launch_bounds__(1024)
     filterKernel(const ValType* dataIn, const typename ComputeT<ValType>::type* kThElePtr,
                  ValType* valOut, IdxType* idxOut, int* globalCount, const int* top_k_arr,
                  const int* taskLenPtr, const int stride, const int max_top_k_val,
-                 const int taskNum) {
+                 const int taskNum, IdxType* indices) {
   using CompT = typename ComputeT<ValType>::type;
 
   __shared__ int blockCount[1];
@@ -2434,6 +2438,7 @@ __global__ void __launch_bounds__(1024)
   const int tx = threadIdx.x, bx = blockIdx.x;
   const int taskId = bx;
   const int taskLen = taskLenPtr[taskId];
+  const int row_idx = indices == nullptr ? taskId : indices[taskId];
   const int k = top_k_arr == nullptr ? max_top_k_val : top_k_arr[taskId];
 
   if (tx == 0) {
@@ -2448,7 +2453,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-        dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        dataIn_vec.cast_load(dataIn + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; j++) {
           int pos = atomicAdd(blockCount, 1);
@@ -2467,7 +2472,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-        dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        dataIn_vec.cast_load(dataIn + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; j++) {
           if (dataIn_vec[j] > kThElem) {
@@ -2487,7 +2492,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < taskLen) {
-        dataIn_vec.cast_load(dataIn + bx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        dataIn_vec.cast_load(dataIn + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; j++) {
           if (dataIn_vec[j] == kThElem) {
@@ -2513,50 +2518,113 @@ __global__ void __launch_bounds__(1024)
   return;
 }
 
+template <int BLOCK_THREADS, typename IdxType, typename ValType>
+__global__ void __launch_bounds__(1024)
+    FillWithTopKIndicesKernel(const ValType* dataIn,
+                              const typename ComputeT<ValType>::type* kThElePtr, IdxType* idxOut,
+                              const int* taskLenPtr, const int stride, IdxType* indices) {
+  using CompT = typename ComputeT<ValType>::type;
+
+  const int tx = threadIdx.x, bx = blockIdx.x;
+  const int taskId = bx;
+  const int taskLen = taskLenPtr[taskId];
+  const int row_idx = indices == nullptr ? taskId : indices[taskId];
+  const CompT kThElem = *(kThElePtr + taskId * stride);
+
+  for (int i = tx; i < taskLen; i += BLOCK_THREADS) {
+    if (dataIn[row_idx * stride + i] == kThElem) {
+      idxOut[taskId] = i;
+      break;
+    }
+  }
+  return;
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromRadiKSelectKernel(DType* select_probs, IdType* select_indices,
-                                              IdType* output, IdType* indices, int* top_k_arr,
+                                              IdType* output, int* top_k_arr, IdType* indices,
                                               uint32_t max_top_k_val, uint64_t philox_seed,
                                               uint64_t philox_offset) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  //   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  const uint32_t row_idx = bx;
-  const int K = top_k_arr == nullptr ? max_top_k_val : top_k_arr[row_idx];
-  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
-                                         REDUCE_ALGORITHM>::TempStorage;
-  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling[];
-  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
+  const int row_idx = indices == nullptr ? bx : indices[bx];
+  const int K = top_k_arr == nullptr ? max_top_k_val : top_k_arr[bx];
+  curandStatePhilox4_32_10_t state;
+  curand_init(philox_seed, bx, philox_offset, &state);
 
-  vec_t<DType, VEC_SIZE> logits_vec;
-  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  extern __shared__ __align__(
+      alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
+      uint8_t smem_sampling[];
+  auto& temp_storage =
+      reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
+          smem_sampling);
+  temp_storage.sampled_id = K;
+  __syncthreads();
+  __shared__ DType block_sum;
+
+  DType thread_sum = 0.f;
+  vec_t<DType, VEC_SIZE> probs_vec;
+
   for (uint32_t i = 0; i < ceil_div(K, BLOCK_THREADS * VEC_SIZE); ++i) {
-    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < K) {
-      logits_vec.cast_load(select_probs + row_idx * max_top_k_val + i * BLOCK_THREADS * VEC_SIZE +
-                           tx * VEC_SIZE);
+      probs_vec.cast_load(select_probs + row_idx * max_top_k_val +
+                          (i * BLOCK_THREADS + tx) * VEC_SIZE);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        thread_sum += probs_vec[j];
+      }
+    }
+  }
+  __syncthreads();
+
+  DType _block_sum =
+      cub::BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
+  if (tx == 0) {
+    block_sum = _block_sum;
+  }
+  __syncthreads();
+
+  DType renorm_factor = math::ptx_rcp(max(block_sum, 1e-8));
+  //   if (tx == 0) {
+  //     printf("row_idx: %d, batch_id: %d, block_sum: %f, radik-renorm normalizer: %f\n", row_idx,
+  //     bx,
+  //            block_sum, renorm_factor);
+  //   }
+
+  // SamplingFrom Renorm probs
+  float aggregate(0);
+  float u = curand_uniform(&state);
+
+  for (uint32_t i = 0; i < ceil_div(K, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(0);
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < K) {
+      probs_vec.cast_load(select_probs + row_idx * max_top_k_val + i * BLOCK_THREADS * VEC_SIZE +
+                          tx * VEC_SIZE);
     }
 
-    vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
-        philox_seed, philox_offset,
-        static_cast<uint64_t>(bx * max_top_k_val + (i * BLOCK_THREADS + tx) * VEC_SIZE));
-    DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      cur_data[j].data = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < K
-                             ? logits_vec[j] + gumbel_noise[j]
-                             : -cuda::std::numeric_limits<DType>::infinity();
-      cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      probs_vec[j] = probs_vec[j] * renorm_factor;
     }
 
-    max_data +=
-        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
-            .Sum<VEC_SIZE>(cur_data);
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                           DETERMINISTIC>(
+        i, K, [](float x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
+    if (float(aggregate) > u) {
+      break;
+    }
   }
-  if (tx == 0) {
-    output[bx] = select_indices[row_idx * max_top_k_val + max_data.index];
+
+  int sampled_id = temp_storage.sampled_id;
+  if (sampled_id == K) {
+    // NOTE(Zihao): this would happen when u is very close to 1
+    // and the sum of probabilities is smaller than u
+    // In this case, we use the last valid index as the sampled id
+    sampled_id = temp_storage.last_valid_id;
   }
+  output[bx] = select_indices[row_idx * max_top_k_val + sampled_id];
+  return;
 }
 
 /*
@@ -2590,9 +2658,10 @@ workSpace 起始地址
 // TODO: consider support indices
 template <typename T, typename IdType>
 cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int* top_k_arr,
-                                  uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                                  uint64_t philox_seed, uint64_t philox_offset,
-                                  void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                                  uint32_t batch_size, uint32_t output_batch_size,
+                                  uint32_t top_k_val, uint32_t d, uint64_t philox_seed,
+                                  uint64_t philox_offset, void* workspace_buffer,
+                                  size_t workspace_buffer_size_in_bytes, T* selected_probs,
                                   cudaStream_t stream = 0) {
   // TODO: Remove TORCH_CHECK into sampling.cu
   //   TORCH_CHECK(top_k_arr == nullptr, "Don't support top_k_arr currently");
@@ -2612,6 +2681,8 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
 
   size_t workSpaceSize = 0;
   getRadixSelectWorkSpaceSize<T, IdType>(max_top_k_val, d, batch_size, &workSpaceSize);
+  //   printf("workSpaceSize: %zuGB\n", workSpaceSize / 1024 / 1024 / 1024);
+  //   printf("batch_size: %d\n", batch_size);
   void* workSpace = 0;
   bool workspace_allocated = false;
   if (workSpaceSize > workspace_buffer_size_in_bytes) {
@@ -2664,15 +2735,14 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
       // dim3 countbin_iter1_nblks(batch_size);
       dim3 countbin_iter1_nthrs(BLOCK_THREADS);
 
-      // auto countbin_iter1_kernel = countBinKernel<BLOCK_THREADS, 0, 20, T>;
-      auto countbin_iter1_kernel = countBinExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T>;
-      void* countbin_iter1_args[] = {&probs, &taskLenPtr[0], &histPtr, &d, &batch_size};
+      auto countbin_iter1_kernel = countBinExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
+      void* countbin_iter1_args[] = {&probs, &taskLenPtr[0], &histPtr, &d, &batch_size, &indices};
 
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter1_kernel, countbin_iter1_nblks,
                                             countbin_iter1_nthrs, countbin_iter1_args, 0, stream));
 
       // iter1: selectBin
-      // printf("=== First iter ===\n");
+      //   printf("=== First iter ===\n");
       dim3 selectbin_iter1_nblks(batch_size);
       dim3 selectbin_iter1_nthrs(BLOCK_THREADS);
       size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
@@ -2693,9 +2763,10 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
       //   dim3 selectcan_iter1_nblks(batch_size);
       dim3 selectcan_iter1_nthrs(BLOCK_THREADS);
 
-      auto selectcan_iter1_kernel = selectCandidateExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T>;
-      void* selectcan_iter1_args[] = {&probs,    &valBuffer[0],  &globalCountPtr,
-                                      &binIdPtr, &taskLenPtr[1], &d};
+      auto selectcan_iter1_kernel =
+          selectCandidateExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
+      void* selectcan_iter1_args[] = {
+          &probs, &valBuffer[0], &globalCountPtr, &binIdPtr, &taskLenPtr[1], &d, &indices};
 
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter1_kernel, selectcan_iter1_nblks,
                                             selectcan_iter1_nthrs, selectcan_iter1_args, 0,
@@ -2713,6 +2784,7 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
         // clear hist and globalCount
         FLASHINFER_CUDA_CALL(
             cudaMemsetAsync(histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
+
         // TODO: SyncStream here?
         // iter2: countBin
         dim3 countbin_iter2_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
@@ -2721,7 +2793,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
         auto countbin_iter2_kernel = countBinKernel<BLOCK_THREADS, 12, 20>;
         void* countbin_iter2_args[] = {&valBuffer[flag], &taskLenPtr[flag], &histPtr, &d,
                                        &batch_size};
-
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter2_kernel, countbin_iter2_nblks,
                                               countbin_iter2_nthrs, countbin_iter2_args, 0,
                                               stream));
@@ -2735,7 +2806,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
 
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
             selectbin_iter2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter2_kernel, selectbin_iter2_nblks,
                                               selectbin_iter2_nthrs, selectbin_iter2_args,
                                               smem_size, stream));
@@ -2817,7 +2887,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
       // each taskLen is d
       FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
                                            sizeof(int) * batch_size, cudaMemcpyDefault, stream));
-
 #define RADIX_TOPK_CALL_FILTER(CACHE_SIZE)                                                  \
   do {                                                                                      \
     auto filter_kernel = filterKernel<BLOCK_THREADS, VEC_SIZE, (CACHE_SIZE), IdType, T>;    \
@@ -2827,11 +2896,17 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
 
       dim3 filter_nblks(batch_size);
       dim3 filter_nthrs(BLOCK_THREADS);
-      void* filter_args[] = {
-          &probs,          &valBuffer[flag], &top_k_select_result, &top_k_select_idx,
-          &globalCountPtr, &top_k_arr,       &taskLenPtr[0],       &d,
-          &max_top_k_val,  &batch_size};
-
+      void* filter_args[] = {&probs,
+                             &valBuffer[flag],
+                             &top_k_select_result,
+                             &top_k_select_idx,
+                             &globalCountPtr,
+                             &top_k_arr,
+                             &taskLenPtr[0],
+                             &d,
+                             &max_top_k_val,
+                             &batch_size,
+                             &indices};
       if (max_top_k_val <= 128) {
         RADIX_TOPK_CALL_FILTER(128);
       } else if (max_top_k_val <= 256) {
@@ -2841,23 +2916,33 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
       } else if (max_top_k_val <= 1024) {
         RADIX_TOPK_CALL_FILTER(1024);
       }
+
+      //   dim3 fill_nblks(output_batch_size);
+      //   dim3 fill_nthrs(BLOCK_THREADS);
+      //   auto fill_kernel = FillWithTopKIndicesKernel<BLOCK_THREADS, IdType, T>;
+      //   void* fill_args[] = {&probs, &valBuffer[flag], &output, &taskLenPtr[0], &d, &indices};
+
+      //   FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)fill_kernel, fill_nblks, fill_nthrs,
+      //   fill_args,
+      //                                         0, stream));
     });
 
     // TODO: Optimize FinalSampling's vec_size
+    // TODO : Fix filterKernel for indices
     vec_size = 1;
-
     // printf("vec_size: %d, top_k_val: %d\n", vec_size, top_k_val);
     // printf("top_k_select_result: %p, top_k_select_idx: %p, output: %p, indices: %p\n",
     //        top_k_select_result, top_k_select_idx, output, indices);
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      dim3 sample_nblks(batch_size);
+      dim3 sample_nblks(output_batch_size);
       dim3 sample_nthrs(BLOCK_THREADS);
       auto sample_kernel = SamplingFromRadiKSelectKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
                                                          VEC_SIZE, false, T, IdType>;
-      const uint32_t sample_smem_size = sizeof(
-          typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
-      void* sample_args[] = {&top_k_select_result, &top_k_select_idx, &output,      &indices,
-                             &top_k_arr,           &max_top_k_val,    &philox_seed, &philox_offset};
+      const uint32_t sample_smem_size =
+          sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+      void* sample_args[] = {&top_k_select_result, &top_k_select_idx, &output,
+                             &top_k_arr,           &indices,          &max_top_k_val,
+                             &philox_seed,         &philox_offset};
 
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)sample_kernel, sample_nblks, sample_nthrs,
                                             sample_args, sample_smem_size, stream));
@@ -2867,6 +2952,11 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
   // check global histgram
   // 等待GPU kernel执行完成
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+
+  if (selected_probs != nullptr) {
+    FLASHINFER_CUDA_CALL(cudaMemcpy(selected_probs, top_k_select_result,
+                                    sizeof(T) * batch_size * top_k_val, cudaMemcpyDefault));
+  }
 
   // // 分配CPU内存来存储第一个任务的histogram
   // std::vector<int> host_histogram(1 << 12, 0);  // 4096个元素
