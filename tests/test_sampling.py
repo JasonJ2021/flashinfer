@@ -732,9 +732,9 @@ if __name__ == "__main__":
 
     # Test incorrect
     # test_radik_sampling(500, 128256, gumbel_distribution(0.1), 99)
-    # test_radik_top_k_sampling_freq(111, normal_distribution(1), 100)
+    test_radik_top_k_sampling_freq(111, normal_distribution(1), 100)
     # test_radik_top_k_sampling_freq(32000, normal_distribution(1), 100)
     # test_radik_top_k_sampling(500, 128256, gumbel_distribution(0.1), 989)
     # test_radik_top_k_renorm(1, 10, gumbel_distribution(0.1), 2)
 
-    test_radik_top_k_renorm_indices(128256, normal_distribution(1), 100)
+    # test_radik_top_k_renorm_indices(128256, normal_distribution(1), 100)
