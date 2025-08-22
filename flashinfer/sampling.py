@@ -223,6 +223,7 @@ def get_sampling_module():
         indices: Optional[torch.Tensor],
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        deterministic: bool,
         selected_probs: Optional[torch.Tensor],
         generator: Optional[torch.Generator],
     ) -> torch.Tensor:
@@ -238,6 +239,7 @@ def get_sampling_module():
             indices,
             maybe_top_k_arr,
             top_k_val,
+            deterministic,
             selected_probs,
             generator,
         )
@@ -843,6 +845,7 @@ def radik_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor] = None,
+    deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     selected_probs: Optional[torch.Tensor] = None,
     check_nan: bool = False,
@@ -896,6 +899,7 @@ def radik_sampling_from_probs(
         probs,
         indices,
         *_to_tensor_scalar_tuple(top_k),
+        deterministic,
         selected_probs,
         generator,
     )

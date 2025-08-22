@@ -283,15 +283,16 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
 void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                               std::optional<at::Tensor> maybe_selected_probs,
+                               bool deterministic, std::optional<at::Tensor> maybe_selected_probs,
                                std::optional<at::Generator> gen_) {
   CHECK_INPUT(workspace_buffer);
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
+  CHECK_GE(1024, top_k_val);  // only support top-k <= 1024 currently
   auto device = probs.device();
   CHECK_EQ(output.device(), device);
-  CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
-  CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_DIM(2, probs);
+  CHECK_DIM(1, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
 
@@ -312,7 +313,7 @@ void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, probs.size(0),
       maybe_indices.has_value() ? maybe_indices->size(0) : batch_size, top_k_val, vocab_size,
-      philox_seed, philox_offset, workspace_buffer.data_ptr(),
+      philox_seed, philox_offset, deterministic, workspace_buffer.data_ptr(),
       workspace_buffer.element_size() * workspace_buffer.size(0),
       maybe_selected_probs.has_value() ? static_cast<float*>(maybe_selected_probs->data_ptr())
                                        : nullptr,
